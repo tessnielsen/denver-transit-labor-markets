@@ -1,0 +1,261 @@
+---
+title: "LA.Thesis"
+author: "Tess Nielsen"
+date: "2026-03-02"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidycensus)
+library(dplyr)
+library(sf)
+library(tidyverse)
+library(fixest)
+library(readr)
+library(janitor)
+library(units)
+library(ggplot2)
+
+```
+
+```{r}
+census_api_key(Sys.getenv("CENSUS_API_KEY"), install = FALSE)
+```
+
+Import data
+
+```{r}
+vars <- c(
+  #commuting data
+  total_commuters = "B08301_001",
+  drove_alone = "B08301_003",
+  public_transport = "B08301_010",
+  light_rail = "B08301_012", #Subway or elevated rail
+  heavy_rail = "B08301_013", #Long distance train or commuter rail
+  #labor variables
+  pop_16_total = "B23025_001", # total population for labor variables
+  in_labor_force = "B23025_002",
+  employed = "B23025_004",
+  median_household_income = "B19013_001",
+  ## control demographics 
+  black = "B02001_003",
+  white = "B02001_002",
+  asian = "B02001_005"
+)
+
+years = 2011:2024
+
+counties <- c("Denver", "Arapahoe", "Jefferson", "Adams", "Douglas")
+```
+
+
+```{r}
+
+den_list <- map(years, ~
+  get_acs(
+    geography = "tract",
+    variables = vars,
+    state = "CO",
+    county = counties,
+    year = .x,
+    geometry = TRUE,
+    output = "wide"
+  ) %>%
+    mutate(year = .x)
+)
+
+denver <- bind_rows(den_list) %>%
+  distinct(GEOID, year, .keep_all = TRUE)
+
+## E is estimate, M is margin of error
+
+```
+
+Import station names for each line with their coresponding coordinates
+```{r}
+## stations
+
+stations_df <- tibble(
+  name = c(
+    # W line
+    "Knox Station", "Sheridan Station", "Lamar Station", "Lakewood-Wadsworth Station",
+    "Garrison Station", "Oak Station", "Federal Center Station", "Red Rocks College Station",
+    "Jefferson County Government Station", "Perry Station", "Decatur-Federal Station",
+    # A line
+    "Denver International Airport Station", "40th & Colorado Station",
+    "Airport/Gateway Park Station", "Central Park Station",
+    "38th & Blake Station", "61st & Peña Station",
+    # B line
+    "Westminster Station", "41st & Fox Station", "Pecos Junction Station",
+    # R line
+    "Nine Mile Station", "Florida Station", "Dayton Station", "Belleview Station",
+    "Dry Creek Station", "County Line Station", "Lincoln Station",
+    # E/F/R Southeast Extension
+    "Sky Ridge Station", "Lone Tree City Center Station", "RidgeGate Parkway Station",
+    # G line
+    "Clear Creek/Federal Station", "60th & Sheridan/Arvada Gold Strike Station",
+    "Olde Town Arvada Station", "Arvada Ridge Station", "Wheat Ridge/Ward Station",
+    # N line
+    "48th & Brighton/National Western Center Station", "Commerce City/72nd Station",
+    "Original Thornton/88th Station", "Thornton Crossroads/104th Station",
+    "Northglenn/112th Station", "Eastlake/124th Station"
+  ),
+  lon = c(
+    # W line
+    -105.0384, -105.0503, -105.0812, -105.0875,
+    -105.1163, -105.1322, -105.1392, -105.1780,
+    -105.1834, -105.0289, -105.0235,
+    # A line
+    -104.6731, -104.9400,
+    -104.8173, -104.8934,
+    -104.9791, -104.8934,
+    # B line
+    -105.0364, -105.0150, -105.0199,
+    # R line
+    -104.8934, -104.9120, -104.9055, -104.9055,
+    -104.9055, -104.9055, -104.9055,
+    # E/F/R Southeast Extension
+    -104.8960, -104.8900, -104.8862,
+    # G line
+    -105.0235, -105.0720,
+    -105.0803, -105.1153, -105.1536,
+    # N line
+    -104.9850, -104.9450,
+    -104.9630, -104.9710,
+    -104.9600, -104.9750
+  ),
+  lat = c(
+    # W line
+    39.7092, 39.7092, 39.7150, 39.7225,
+    39.7249, 39.7271, 39.7275, 39.7356,
+    39.7381, 39.7073, 39.7393,
+    # A line
+    39.8561, 39.7751,
+    39.8122, 39.7558,
+    39.7649, 39.8244,
+    # B line
+    39.8364, 39.7867, 39.7950,
+    # R line
+    39.6469, 39.6670, 39.6459, 39.6199,
+    39.5961, 39.5737, 39.5544,
+    # E/F/R Southeast Extension
+    39.5350, 39.5260, 39.5282,
+    # G line
+    39.8012, 39.8278,
+    39.8325, 39.8349, 39.7674,
+    # N line
+    39.7867, 39.8122,
+    39.8622, 39.9003,
+    39.9192, 39.9544
+  ),
+  lines = c(
+    # W line
+    "W", "W", "W", "W",
+    "W", "W", "W", "W",
+    "W", "W", "W/G",
+    # A line
+    "A", "A",
+    "A", "A",
+    "A", "A",
+    # B line (41st & Fox and Pecos Junction are shared with G)
+    "B", "B/G", "B/G",
+    # R line (Nine Mile is shared with E/F)
+    "E/F/R", "R", "R", "R",
+    "R", "R", "R",
+    # E/F/R Southeast Extension
+    "E/F/R", "E/F/R", "E/F/R",
+    # G line
+    "G", "G",
+    "G", "G", "G",
+    # N line
+    "N", "N",
+    "N", "N",
+    "N", "N"
+  )
+)
+```
+
+
+```{r}
+stations_sf <- stations_df %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(26954)  # Colorado Central projection (meters) for accurate distance
+```
+
+```{r}
+## tract centroids
+
+denver_centroids <- denver %>%
+  st_transform(26954) %>%
+  st_centroid()
+
+```
+
+Assign treatment years to lines
+
+```{r}
+# treatment period tags
+stations_sf <- stations_sf %>%
+  mutate(treat_period = case_when(
+    lines == "W"                        ~ 2013,
+    lines %in% c("A", "B", "R", "E/F/R") ~ 2016,
+    lines %in% c("B/G", "W/G", "G", "N") ~ 2019,
+    lines == "E/F/R"                    ~ 2019,
+    TRUE ~ NA_real_
+  ))
+```
+
+For each tract, find the nearest station and its distance
+
+```{r}
+nearest_idx <- st_nearest_feature(denver_centroids, stations_sf)
+nearest_dist <- st_distance(denver_centroids, stations_sf[nearest_idx, ], by_element = TRUE)
+
+denver_centroids <- denver_centroids %>%
+  mutate(
+    nearest_station  = stations_sf$name[nearest_idx],
+    nearest_dist_m   = as.numeric(nearest_dist),
+    station_period   = stations_sf$treat_period[nearest_idx],
+    within_800m      = nearest_dist_m <= 800
+  )
+```
+
+Create a treated group based on an 800m range
+```{r}
+denver <- denver %>%
+  left_join(
+    st_drop_geometry(denver_centroids) %>%
+      select(GEOID, nearest_station, nearest_dist_m, station_period, within_800m) %>%
+      distinct(GEOID, .keep_all = TRUE),
+    by = "GEOID"
+  ) %>%
+  mutate(
+    treated = case_when(
+      !within_800m                   ~ 0,
+      year >= station_period         ~ 1,
+      TRUE                           ~ 0
+    ),
+    post_W   = as.integer(within_800m & station_period == 2013 & year >= 2013),
+    post_ABR = as.integer(within_800m & station_period == 2016 & year >= 2016),
+    post_GN  = as.integer(within_800m & station_period == 2019 & year >= 2019)
+  )
+```
+
+
+```{r}
+denver_treated <- denver %>%
+  filter(treated == 1)
+```
+
+
+Create "doughnut" of control group
+
+
+Propensity score matching
+
