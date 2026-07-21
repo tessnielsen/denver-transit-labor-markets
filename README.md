@@ -21,9 +21,13 @@ Does expanding a public transit network improve labor market outcomes (income, e
 
 ## Status
 ✅ Data pull and cleaning complete
+
 ✅ Spatial join and treatment cohort assignment complete
+
 🔄 Control group construction (propensity score matching) in progress
+
 🔄 Event-study regression estimation not yet run
+
 📅 Full results expected as part of senior thesis, Fall 2026
 
 ## Tools
