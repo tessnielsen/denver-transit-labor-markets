@@ -19,19 +19,9 @@ Does expanding a public transit network improve labor market outcomes (income, e
 - Outcome variables: median household income, hours worked, unemployment rate
 - Controls: age, education, racial composition, residential stability (to help distinguish labor market improvement from gentrification/compositional change)
 
-## Status
-✅ Data pull and cleaning complete
-
-✅ Spatial join and treatment cohort assignment complete
-
-🔄 Control group construction (propensity score matching) in progress
-
-🔄 Event-study regression estimation not yet run
-
-📅 Full results expected as part of senior thesis, Fall 2026
 
 ## Tools
 R, `tidycensus`, `sf`, `dplyr`, `fixest`, `ggplot2`
-
+ArcGIS Online
 ## Files
 - `Denver.Rmd` — data import, spatial join, and treatment assignment pipeline
