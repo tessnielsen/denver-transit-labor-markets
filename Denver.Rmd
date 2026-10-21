@@ -1,5 +1,5 @@
 ---
-title: "LA.Thesis"
+title: "Denver.Thesis"
 author: "Tess Nielsen"
 date: "2026-03-02"
 output: html_document
@@ -21,6 +21,7 @@ library(readr)
 library(janitor)
 library(units)
 library(ggplot2)
+library(tinytex)
 
 ```
 
@@ -30,23 +31,40 @@ census_api_key(Sys.getenv("CENSUS_API_KEY"), install = FALSE)
 
 Import data
 
-```{r}
+```{r, results='hide'}
 vars <- c(
   #commuting data
   total_commuters = "B08301_001",
   drove_alone = "B08301_003",
   public_transport = "B08301_010",
-  light_rail = "B08301_012", #Subway or elevated rail
-  heavy_rail = "B08301_013", #Long distance train or commuter rail
   #labor variables
   pop_16_total = "B23025_001", # total population for labor variables
   in_labor_force = "B23025_002",
   employed = "B23025_004",
+  unemployed = "B23025_005",
+  mean_hours_worked = "B23020_001",
   median_household_income = "B19013_001",
-  ## control demographics 
+  ## population/demographics
+  total_pop = "B01003_001",
   black = "B02001_003",
-  white = "B02001_002",
-  asian = "B02001_005"
+  white_nonhispanic = "B03002_003",  
+  asian = "B02001_005",
+  ## Controls
+  median_age = "B01002_001",
+  total_pop_race = "B03002_001",
+  edu_pop_25plus = "B15002_001",
+  bach_m = "B15002_015",
+  mast_m = "B15002_016",
+  prof_m = "B15002_017",
+  doct_m = "B15002_018",
+  bach_f = "B15002_032",
+  mast_f = "B15002_033",
+  prof_f = "B15002_034",
+  doct_f = "B15002_035",
+  poverty_denom = "B17001_001",
+  poverty_below = "B17001_002",
+  pop_1yr_and_over = "B07001_001",
+  same_house_1yr = "B07001_017"
 )
 
 years = 2011:2024
@@ -55,7 +73,7 @@ counties <- c("Denver", "Arapahoe", "Jefferson", "Adams", "Douglas")
 ```
 
 
-```{r}
+```{r, results = 'hide'}
 
 den_list <- map(years, ~
   get_acs(
@@ -67,17 +85,92 @@ den_list <- map(years, ~
     geometry = TRUE,
     output = "wide"
   ) %>%
-    mutate(year = .x)
-)
+    mutate(year = .x),
+  error = function(e) {
+      message("Year ", .x, " failed: ", conditionMessage(e))
+      NULL})
 
 denver <- bind_rows(den_list) %>%
   distinct(GEOID, year, .keep_all = TRUE)
 
 ## E is estimate, M is margin of error
 
+
 ```
 
-Import station names for each line with their coresponding coordinates
+Calculated variables
+```{r}
+denver <- denver %>%
+  mutate(
+    ## outcomes
+    unemployment_rate = unemployedE / in_labor_forceE,
+    mean_hours_worked = mean_hours_workedE,
+    median_household_income = median_household_incomeE,
+    ##control vector
+    median_age = median_ageE,
+    white_nonhispanic_share  = white_nonhispanicE / total_pop_raceE,
+    bachelors_plus_share = (bach_mE + mast_mE + prof_mE + doct_mE +
+                                 bach_fE + mast_fE + prof_fE + doct_fE) / edu_pop_25plusE,
+    poverty_rate = poverty_belowE / poverty_denomE,
+    residential_stability = same_house_1yrE / pop_1yr_and_overE,
+
+    tract_area_sqmi = as.numeric(set_units(st_area(geometry), "mi^2")),
+    pop_density = total_popE / tract_area_sqmi
+  )
+```
+
+```{r}
+treated_buffer <- st_read("treated_buffer.geojson") %>%
+  st_transform(26954) %>%
+  st_make_valid()
+
+control_buffer <- st_read("control_buffer.geojson") %>%
+  st_transform(26954) %>%
+  st_make_valid()
+
+tract_vintages <- denver %>%
+  st_transform(26954) %>%
+  st_make_valid() %>%
+  mutate(vintage = if_else(year >= 2020, "2020", "2010")) %>%
+  distinct(GEOID, vintage, .keep_all = TRUE) %>%
+  select(GEOID, vintage, geometry) %>%
+  mutate(tract_area_m2 = as.numeric(st_area(geometry)))
+
+# total overlap area between each tract and a buffer
+overlap_area <- function(tracts_sf, buffer_sf, out_name) {
+  inter <- st_intersection(tracts_sf, st_geometry(st_union(buffer_sf)))
+  inter %>%
+    st_drop_geometry() %>%
+    mutate(area_m2 = as.numeric(st_area(inter$geometry))) %>%
+    group_by(GEOID, vintage) %>%
+    summarise(area_m2 = sum(area_m2), .groups = "drop") %>%
+    rename(!!out_name := area_m2)
+}
+
+treat_overlap <- overlap_area(tract_vintages, treated_buffer, "treat_int_m2")
+ctrl_overlap  <- overlap_area(tract_vintages, control_buffer,  "ctrl_int_m2")
+
+# into pct overlap and apply 40% rule 
+tract_classification <- tract_vintages %>%
+  st_drop_geometry() %>%
+  left_join(treat_overlap, by = c("GEOID", "vintage")) %>%
+  left_join(ctrl_overlap,  by = c("GEOID", "vintage")) %>%
+  mutate(
+    treat_int_m2 = replace_na(treat_int_m2, 0),
+    ctrl_int_m2  = replace_na(ctrl_int_m2, 0),
+    pct_treat = treat_int_m2/tract_area_m2 * 100,
+    pct_ctrl  = ctrl_int_m2/tract_area_m2 * 100,
+    group_40 = case_when(
+      pct_treat >= 40 ~ "treated",
+      pct_ctrl  >= 40 ~ "control",
+      TRUE ~ "excluded"
+    )
+  )
+
+write_csv(tract_classification, "tract_classification.csv")
+```
+
+Import station names for each line with their corresponding coordinates
 ```{r}
 ## stations
 
@@ -185,11 +278,14 @@ stations_df <- tibble(
 ```{r}
 stations_sf <- stations_df %>%
   st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
-  st_transform(26954)  # Colorado Central projection (meters) for accurate distance
+  st_transform(26954)# Colorado Central projection (meters) for accurate distance
 ```
 
 ```{r}
 ## tract centroids
+stations_sf <- stations_df %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(26954)  # Colorado Central projection (meters) 
 
 denver_centroids <- denver %>%
   st_transform(26954) %>%
@@ -197,16 +293,15 @@ denver_centroids <- denver %>%
 
 ```
 
-Assign treatment years to lines
-
+Create REAL treatment groups
 ```{r}
 # treatment period tags
 stations_sf <- stations_sf %>%
   mutate(treat_period = case_when(
-    lines == "W"                        ~ 2013,
+    lines == "W"~ 2013,
     lines %in% c("A", "B", "R", "E/F/R") ~ 2016,
     lines %in% c("B/G", "W/G", "G", "N") ~ 2019,
-    lines == "E/F/R"                    ~ 2019,
+    lines == "E/F/R" ~ 2019,
     TRUE ~ NA_real_
   ))
 ```
@@ -219,43 +314,371 @@ nearest_dist <- st_distance(denver_centroids, stations_sf[nearest_idx, ], by_ele
 
 denver_centroids <- denver_centroids %>%
   mutate(
-    nearest_station  = stations_sf$name[nearest_idx],
-    nearest_dist_m   = as.numeric(nearest_dist),
-    station_period   = stations_sf$treat_period[nearest_idx],
-    within_800m      = nearest_dist_m <= 800
+    nearest_station = stations_sf$name[nearest_idx],
+    nearest_dist_m = as.numeric(nearest_dist),
+    station_period = stations_sf$treat_period[nearest_idx],
+    within_1200m = nearest_dist_m <= 1200
   )
 ```
 
-Create a treated group based on an 800m range
+temporary treatment group(1200 meters)
 ```{r}
 denver <- denver %>%
   left_join(
     st_drop_geometry(denver_centroids) %>%
-      select(GEOID, nearest_station, nearest_dist_m, station_period, within_800m) %>%
+      select(GEOID, nearest_station, nearest_dist_m, station_period, within_1200m) %>%
       distinct(GEOID, .keep_all = TRUE),
     by = "GEOID"
   ) %>%
   mutate(
     treated = case_when(
-      !within_800m                   ~ 0,
-      year >= station_period         ~ 1,
-      TRUE                           ~ 0
+      !within_1200m ~ 0,
+      year >= station_period ~ 1,
+      TRUE ~ 0
     ),
-    post_W   = as.integer(within_800m & station_period == 2013 & year >= 2013),
-    post_ABR = as.integer(within_800m & station_period == 2016 & year >= 2016),
-    post_GN  = as.integer(within_800m & station_period == 2019 & year >= 2019)
+    post_W   = as.integer(within_1200m & station_period == 2013 & year >= 2013),
+    post_ABR = as.integer(within_1200m & station_period == 2016 & year >= 2016),
+    post_GN  = as.integer(within_1200m & station_period == 2019 & year >= 2019)
   )
-```
 
-
-```{r}
 denver_treated <- denver %>%
   filter(treated == 1)
 ```
 
+temporary control group (donut)
+```{r}
+denver_doughnut <- denver %>%
+  mutate(
+    control = case_when(
+      !within_1200m & nearest_dist_m <= 4828.03 & nearest_dist_m > 1609.34 ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  filter(control == 1)
+```
 
-Create "doughnut" of control group
+Fix mismatched tract geoIDs from pre 2010
+```{r}
+denver <- denver %>%
+  mutate(vintage = if_else(year >= 2020, "2020", "2010")) %>%
+  left_join(
+    tract_classification %>% select(GEOID, vintage, pct_treat, pct_ctrl, group_40),
+    by = c("GEOID", "vintage")
+  ) %>%
+  mutate(
+    treated_40 = as.integer(group_40 == "treated" & year >= station_period),
+    post_W_40   = as.integer(treated_40 == 1 & station_period == 2013),
+    post_ABR_40 = as.integer(treated_40 == 1 & station_period == 2016),
+    post_GN_40  = as.integer(treated_40 == 1 & station_period == 2019),
+    keep_sample_40 = group_40 %in% c("treated", "control")
+  )
+```
 
+Trim down variables
+```{r}
+denver <- denver %>%
+  select(-c(bach_mE, mast_mE, prof_mE, doct_mE,
+            bach_fE, mast_fE, prof_fE, doct_fE,
+            poverty_belowE, poverty_denomE,
+            same_house_1yrE, pop_1yr_and_overE,
+            edu_pop_25plusE, total_pop_raceE, white_nonhispanicE,
+            median_ageE, unemployedE, mean_hours_workedE, median_household_incomeE))
+```
 
-Propensity score matching
+Drop outliers (like the airport)
+```{r}
+denver %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(min_pop = min(total_popE, na.rm = TRUE), max_pop = max(total_popE, na.rm = TRUE)) %>%
+  filter(max_pop == 0) %>%
+  pull(GEOID)
+
+zero_pop_tracts <- denver %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(max_pop = max(total_popE, na.rm = TRUE)) %>%
+  filter(max_pop == 0) %>%
+  pull(GEOID)
+
+## tracts include rocky mountain arsenal natl refuge, government buildings, and wildlife refuge. one was a treatment tract, worth flagging
+
+excluded_tracts <- c("08031980001", "08031000800", zero_pop_tracts) 
+
+denver <- denver %>%
+  filter(!GEOID %in% excluded_tracts)
+```
+
+Reorder data set
+```{r}
+denver <- denver %>%
+  select(
+    GEOID, year, treated, post_W, post_ABR, post_GN, station_period, nearest_station, unemployment_rate, mean_hours_worked, median_household_income, median_age, white_nonhispanic_share, bachelors_plus_share, poverty_rate, residential_stability,
+    everything()
+  )
+```
+
+ 
+ Summary stats
+```{r}
+denver_40pct <- denver %>%
+  filter(keep_sample_40) %>%
+  mutate(
+    group = case_when(
+      group_40 == "treated" ~ "Treated",
+      group_40 == "control" ~ "Control"
+    ),
+    period = case_when(
+      station_period == 2013 & year %in% 2011:2012 ~ "Pre",
+      station_period == 2013 & year %in% 2018:2019 ~ "Post",
+      station_period == 2016 & year %in% 2014:2015 ~ "Pre",
+      station_period == 2016 & year %in% 2018:2019 ~ "Post",
+      station_period == 2019 & year %in% 2017:2018 ~ "Pre",
+      station_period == 2019 & year %in% 2023:2024 ~ "Post",
+      TRUE ~ NA_character_
+    )
+  )
+
+denver_stats_csv <- denver_40pct %>%
+  sf::st_drop_geometry() %>%
+  filter(!is.na(group), !is.na(period)) %>%
+  group_by(station_period, group, period) %>%
+  summarise(
+    n = n(),
+    mean_unemployment = mean(unemployment_rate, na.rm = TRUE),
+    min_unemployment = min(unemployment_rate, na.rm = TRUE),
+    max_unemployment = max(unemployment_rate, na.rm = TRUE),
+    sd_unemployment = sd(unemployment_rate, na.rm = TRUE),
+
+    min_hour = min(mean_hours_worked, na.rm = TRUE),
+    max_hour = max(mean_hours_worked, na.rm = TRUE),
+    sd_hours = sd(mean_hours_worked, na.rm = TRUE),
+    mean_hours_worked = mean(mean_hours_worked, na.rm = TRUE),
+
+    mean_household_income = mean(median_household_income, na.rm = TRUE),
+    min_income = min(median_household_income, na.rm = TRUE),
+    max_income = max(median_household_income, na.rm = TRUE),
+    sd_income = sd(median_household_income, na.rm = TRUE),
+
+    mean_residential_stability = mean(residential_stability, na.rm = TRUE),
+    min_res_stab = min(residential_stability, na.rm = TRUE),
+    max_res_stab = max(residential_stability, na.rm = TRUE),
+    sd_res_stab = sd(residential_stability, na.rm = TRUE),
+
+    mean_age = mean(median_age, na.rm = TRUE),
+    min_age = min(median_age, na.rm = TRUE),
+    max_age = max(median_age, na.rm = TRUE),
+    sd_age = sd(median_age, na.rm = TRUE),
+
+    mean_white_NH = mean(white_nonhispanic_share, na.rm = TRUE),
+    min_white = min(white_nonhispanic_share, na.rm = TRUE),
+    max_white = max(white_nonhispanic_share, na.rm = TRUE),
+    sd_white = sd(white_nonhispanic_share, na.rm = TRUE),
+
+    mean_bachelors_plus = mean(bachelors_plus_share, na.rm = TRUE),
+    min_bachelors = min(bachelors_plus_share, na.rm = TRUE),
+    max_bachelors = max(bachelors_plus_share, na.rm = TRUE),
+    sd_bachelors = sd(bachelors_plus_share, na.rm = TRUE),
+
+    mean_poverty_rate = mean(poverty_rate, na.rm = TRUE),
+    min_poverty = min(poverty_rate, na.rm = TRUE),
+    max_poverty = max(poverty_rate, na.rm = TRUE),
+    sd_poverty = sd(poverty_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(denver_stats_csv, "denver_stats.csv", row.names = FALSE)
+```
+
+########## Propensity score matching ####################
+```{r}
+library(MatchIt)
+library(cobalt)
+
+match_cohort <- function(df) {
+  matchit(
+    treated_ever ~ log_income + median_age + white_nonhispanic_share +
+      bachelors_plus_share + poverty_rate + residential_stability +
+      unemployment_rate + log_pop_density,
+    data = df,
+    method = "full",
+    distance = "glm",
+    discard = "both"
+  )
+}
+```
+
+```{r}
+build_baseline <- function(pre_years, cohort_label) {
+  denver %>%
+    sf::st_drop_geometry() %>%
+    filter(year %in% pre_years) %>%
+    group_by(GEOID, group_40) %>%
+    summarise(across(
+      c(unemployment_rate, median_household_income, median_age, white_nonhispanic_share,
+        bachelors_plus_share, poverty_rate, residential_stability, pop_density),
+      ~ mean(.x, na.rm = TRUE)
+    ), .groups = "drop") %>%
+    mutate(
+      cohort = cohort_label,
+      treated_ever = as.integer(GEOID %in% (denver %>% st_drop_geometry() %>%
+                                    filter(group_40 == "treated", station_period == cohort_label) %>%
+                                    pull(GEOID))),
+      log_income = log(median_household_income),
+      log_pop_density = log(pop_density)
+    ) %>%
+    filter(treated_ever == 1 | group_40 %in% c("control", "excluded")) %>%
+    drop_na(log_income, median_age, white_nonhispanic_share, bachelors_plus_share,
+            poverty_rate, residential_stability, unemployment_rate, log_pop_density) %>%
+    filter(is.finite(log_income), is.finite(log_pop_density))
+}
+
+baseline_2013 <- build_baseline(2011:2012, 2013)
+baseline_2016 <- build_baseline(2014:2015, 2016)
+baseline_2019 <- build_baseline(2017:2018, 2019)
+```
+
+```{r}
+cohort_matches <- list(baseline_2013, baseline_2016, baseline_2019) %>%
+  map(match_cohort)
+
+matched_all <- map_dfr(cohort_matches, match.data)
+```
+
+```{r}
+matched_all %>% count(cohort, treated_ever, discarded = weights == 0)
+matched_all %>% count(GEOID) %>% filter(n > 1)
+```
+
+```{r}
+weight_lookup <- matched_all %>%
+  distinct(GEOID, cohort, .keep_all = TRUE) %>%
+  select(GEOID, cohort, psm_weight = weights)
+```
+
+```{r}
+denver <- denver %>%
+  left_join(weight_lookup, by = c("GEOID", "station_period" = "cohort")) %>%
+  mutate(psm_sample = as.integer(!is.na(psm_weight) & psm_weight > 0))
+```
+
+```{r}
+cohort_labels <- c("2013 (W line)", "2016 (A/B/R lines)", "2019 (G/N lines)")
+
+var_names <- c(
+  log_income = "log(median household income)",
+  log_pop_density = "log(population density)",
+  median_age = "median_age",
+  white_nonhispanic_share = "white_nonhispanic_share",
+  bachelors_plus_share = "bachelors_plus_share",
+  poverty_rate = "poverty_rate",
+  residential_stability = "residential_stability",
+  unemployment_rate = "unemployment_rate",
+  distance = "distance"
+)
+
+walk2(cohort_matches, cohort_labels, ~ {
+  print(.y)
+  print(summary(.x))
+  print(love.plot(.x, threshold = 0.1, var.names = var_names) +
+          ggtitle(paste("Covariate Balance —", .y)))
+})
+```
+
+RESULTS
+```{r}
+did_data <- denver_40pct %>%
+  st_drop_geometry() %>%
+  filter(!is.na(period)) %>%
+  mutate(
+    log_income = log(median_household_income),
+    treat_post = as.integer(group == "Treated" & period == "Post")
+  )
+
+did_buffer <- feols(
+  c(unemployment_rate, mean_hours_worked, log_income) ~ treat_post | GEOID + year,
+  data = did_data, split = ~station_period, cluster = ~GEOID
+)
+
+etable(did_buffer, keep = "treat_post")
+```
+
+```{r}
+psm_data <- denver %>%
+  st_drop_geometry() %>%
+  select(-any_of(c("psm_weight", "psm_sample", "station_period"))) %>%
+  inner_join(
+    select(matched_all, GEOID, station_period = cohort, treat = treated_ever, psm_weight = weights),
+    by = "GEOID", relationship = "many-to-many"
+  ) %>%
+  mutate(
+    period = case_when(
+      station_period == 2013 & year %in% 2011:2012 ~ "Pre",
+      station_period == 2013 & year %in% 2018:2019 ~ "Post",
+      station_period == 2016 & year %in% 2014:2015 ~ "Pre",
+      station_period == 2016 & year %in% 2018:2019 ~ "Post",
+      station_period == 2019 & year %in% 2017:2018 ~ "Pre",
+      station_period == 2019 & year %in% 2023:2024 ~ "Post"
+    ),
+    log_income = log(median_household_income),
+    treat_post = treat * (period == "Post")
+  ) %>%
+  filter(!is.na(period), psm_weight > 0)
+
+did_psm <- feols(
+  c(unemployment_rate, mean_hours_worked, log_income) ~ treat_post | GEOID + year,
+  data = psm_data, weights = ~psm_weight, split = ~station_period, cluster = ~GEOID
+)
+
+etable(did_psm, keep = "treat_post")
+```
+
+```{r}
+controls <- c("median_age", "bachelors_plus_share", "white_nonhispanic_share",
+              "poverty_rate", "residential_stability")
+
+did_data %>%
+  select(GEOID, year, station_period, treat_post,
+         unemployment_rate, mean_hours_worked, log_income, all_of(controls)) %>%
+  write_csv("stata_buffer.csv")
+
+psm_data %>%
+  select(GEOID, year, station_period, treat_post, psm_weight,
+         unemployment_rate, mean_hours_worked, log_income, all_of(controls)) %>%
+  write_csv("stata_psm.csv")
+```
+
+COMPOUNDING EFFECTS
+```{r}
+comp_data <- denver_40pct %>%
+  st_drop_geometry() %>%
+  filter(station_period %in% c(2013, 2016), group %in% c("Treated", "Control")) %>%
+  mutate(
+    log_income = log(median_household_income),
+    treated    = as.integer(group == "Treated"),
+    stage = case_when(
+      station_period == 2013 & year %in% 2011:2012 ~ 0L,
+      station_period == 2013 & year %in% 2014:2015 ~ 1L,
+      station_period == 2013 & year %in% 2018:2019 ~ 2L,
+      station_period == 2013 & year %in% 2023:2024 ~ 3L,
+      station_period == 2016 & year %in% 2014:2015 ~ 0L,
+      station_period == 2016 & year %in% 2018:2019 ~ 2L,
+      station_period == 2016 & year %in% 2023:2024 ~ 3L)) %>%
+  filter(!is.na(stage)) %>%
+  mutate(step1 = treated * (stage >= 1),
+         step2 = treated * (stage >= 2),
+         step3 = treated * (stage >= 3))
+
+comp_13 <- feols(c(unemployment_rate, mean_hours_worked, log_income) ~ step1 + step2 + step3 | GEOID + year,
+                 data = filter(comp_data, station_period == 2013), cluster = ~GEOID)
+comp_16 <- feols(c(unemployment_rate, mean_hours_worked, log_income) ~ step2 + step3 | GEOID + year,
+                 data = filter(comp_data, station_period == 2016), cluster = ~GEOID)
+
+etable(comp_13, comp_16)
+
+comp_data %>%
+  select(GEOID, year, station_period, stage, step1, step2, step3,
+         unemployment_rate, mean_hours_worked, log_income) %>%
+  write_csv("stata_compound.csv", na = "")
+```
 
